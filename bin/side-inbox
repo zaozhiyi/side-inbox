@@ -1,0 +1,138 @@
+#!/bin/bash
+# side-inbox — save whatever you copied into a local inbox folder (~/inbox),
+# so output from read-only AI windows (Claude Code side chat, Codex /side,
+# ChatGPT web, ...) is kept on disk without passing through your main agent.
+#
+# Usage:
+#   side-inbox quick                     For a hotkey: save clipboard now, show a notification
+#   side-inbox stage                     Save clipboard to a staging file and print a preview
+#   side-inbox commit <staged> [title]   Move a staged file into the inbox
+#   side-inbox discard <staged>          Drop a staged file
+#   side-inbox list                      List items waiting in the inbox
+#   side-inbox merged <name> <dest>      Record that an item was filed (used by the merge skill)
+#   side-inbox path                      Print the inbox directory
+#
+# Env: SIDE_INBOX_DIR overrides the inbox location (default ~/inbox).
+set -euo pipefail
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+INBOX="${SIDE_INBOX_DIR:-$HOME/inbox}"
+STAGING="$INBOX/.staging"
+LOG="$INBOX/.log"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Messages follow the macOS UI language (Chinese or English).
+if defaults read -g AppleLanguages 2>/dev/null | grep -q '"zh'; then ZH=1; else ZH=0; fi
+msg() { if [ "$ZH" = 1 ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+notify() {
+  local t=${1//\"/\\\"} b=${2//\"/\\\"}
+  osascript -e "display notification \"$b\" with title \"$t\"" >/dev/null 2>&1 || true
+}
+
+# File-name-safe title, max 40 characters (not bytes).
+sanitize_title() {
+  printf '%s' "$1" | tr -d '\r' \
+    | sed -E 's#[/:*?"<>|\\]+# #g' \
+    | perl -CS -pe 's/^\s+|\s+$//g; s/^(.{40}).*/$1/'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+stage)
+  mkdir -p "$STAGING"
+  ts=$(date +%Y-%m-%d-%H%M%S)
+  tmp="$STAGING/$ts.md"
+  pbpaste > "$tmp" 2>/dev/null || true
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    msg "Clipboard is empty or not text." "剪贴板为空，或内容不是文本（比如图片）。" >&2; echo >&2
+    exit 1
+  fi
+  if [ -n "$(tail -c1 "$tmp")" ]; then echo >> "$tmp"; fi
+  lines=$(wc -l < "$tmp" | tr -d ' ')
+  chars=$(wc -m < "$tmp" | tr -d ' ')
+  title=$(grep -m1 -E '^#{1,6} ' "$tmp" | sed -E 's/^#{1,6} +//' || true)
+  [ -n "$title" ] || title=$(grep -m1 -vE '^[[:space:]]*$' "$tmp" || true)
+  title=$(sanitize_title "$title")
+  echo "STAGED=$tmp"
+  echo "LINES=$lines"
+  echo "CHARS=$chars"
+  echo "TITLE=$title"
+  echo "--- first 5 lines ---"; head -5 "$tmp"
+  echo "--- last 2 lines ---";  tail -2 "$tmp"
+  ;;
+commit)
+  staged="${2:?missing staged file path}"
+  title="${3:-}"
+  [ -f "$staged" ] || { echo "staged file not found: $staged" >&2; exit 1; }
+  base=$(basename "$staged" .md)
+  [ -n "$title" ] || title="untitled"
+  dest="$INBOX/${base}-$(sanitize_title "$title").md"
+  mv "$staged" "$dest"
+  lines=$(wc -l < "$dest" | tr -d ' ')
+  printf '%s\tsaved\t%s\t%s lines\tsource=clipboard\n' "$(date '+%F %T')" "$(basename "$dest")" "$lines" >> "$LOG"
+  echo "SAVED=$dest"
+  echo "LINES=$lines"
+  ;;
+discard)
+  rm -f "${2:?missing staged file path}"
+  msg "Discarded." "已丢弃。"; echo
+  ;;
+list)
+  shopt -s nullglob
+  files=("$INBOX"/*.md)
+  if [ ${#files[@]} -eq 0 ]; then msg "Inbox is empty." "收件箱是空的。"; echo; exit 0; fi
+  i=0
+  for f in "${files[@]}"; do
+    i=$((i+1))
+    l=$(wc -l < "$f" | tr -d ' ')
+    first=$(grep -m1 -vE '^[[:space:]]*$' "$f" | perl -CS -pe 's/^(.{60}).*/$1/' || true)
+    printf '%d) %s  (%s lines)  %s\n' "$i" "$(basename "$f")" "$l" "$first"
+  done
+  ;;
+merged)
+  name="${2:?missing file name}"; dest="${3:?missing destination}"
+  mkdir -p "$INBOX"
+  printf '%s\tmerged\t%s\t-> %s\n' "$(date '+%F %T')" "$name" "$dest" >> "$LOG"
+  msg "Logged." "已记录。"; echo
+  ;;
+path)
+  echo "$INBOX"
+  ;;
+quick)
+  # No questions asked. Two guards against saving the wrong thing:
+  #  1. macOS bumps a clipboard change counter on every copy; if it has not
+  #     moved since the last save, nothing new was copied -> skip.
+  #  2. If identical content is already in the inbox -> skip.
+  mkdir -p "$INBOX"
+  cc=$(osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSPasteboard.generalPasteboard.changeCount' 2>/dev/null || echo "")
+  last=$(cat "$INBOX/.last_clip" 2>/dev/null || echo "")
+  if [ -n "$cc" ] && [ "$cc" = "$last" ]; then
+    notify "$(msg 'Inbox: not saved' '收件箱：没存')" "$(msg 'Nothing new was copied since the last save' '剪贴板自上次存过后没有新复制的内容')"
+    exit 0
+  fi
+  out=$("$SELF" stage 2>/dev/null) || { notify "$(msg 'Inbox: not saved' '收件箱：没存')" "$(msg 'Clipboard is empty or not text' '剪贴板为空，或不是文字')"; exit 0; }
+  staged=$(printf '%s\n' "$out" | sed -n 's/^STAGED=//p')
+  title=$(printf '%s\n' "$out" | sed -n 's/^TITLE=//p')
+  lines=$(printf '%s\n' "$out" | sed -n 's/^LINES=//p')
+  shopt -s nullglob
+  for f in "$INBOX"/*.md; do
+    if cmp -s "$staged" "$f"; then
+      rm -f "$staged"
+      [ -n "$cc" ] && printf '%s' "$cc" > "$INBOX/.last_clip"
+      notify "$(msg 'Inbox: not saved' '收件箱：没存')" "$(msg 'Already saved as' '这段已经存过了：') $(basename "$f")"
+      exit 0
+    fi
+  done
+  "$SELF" commit "$staged" "$title" >/dev/null
+  [ -n "$cc" ] && printf '%s' "$cc" > "$INBOX/.last_clip"
+  hint=""
+  if [ "${lines:-0}" -lt 3 ]; then hint=" · $(msg 'very short — copied the right thing?' '很短，确认是不是复制错了')"; fi
+  notify "$(msg "Inbox: saved $lines lines" "收件箱：已存 $lines 行")" "${title}${hint}"
+  ;;
+*)
+  echo "usage: side-inbox quick | stage | commit <staged> [title] | discard <staged> | list | merged <name> <dest> | path" >&2
+  exit 2
+  ;;
+esac
