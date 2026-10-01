@@ -50,6 +50,8 @@ In the Shortcuts app create a new shortcut, add the action **Run Shell Script**,
 then give it a keyboard shortcut from ⓘ.
 </details>
 
+**Keyboard mapping and conflicts.** `⌃` means Control, `⌥` means Option, and `⌘` means Command. On external keyboards, Ctrl, Alt, and Windows/Start may map differently depending on keyboard mode or macOS settings; use the modifiers macOS actually recognizes. `⌃⌥I` is an example, not a requirement. Choose another combination in Shortcuts if it conflicts with a tool such as Typeless; you do not need to change that tool's settings.
+
 ## Use
 
 | You want to… | Do this |
